@@ -5,7 +5,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import crypto from 'crypto';
-import { prisma } from './db';
+import { supabase } from './db';
 import authRouter from './routes/auth';
 import { verifyToken } from './auth';
 
@@ -90,14 +90,14 @@ const tick = async () => {
       if (history.length > 20) history.shift();
       
       // Save Round to History
-      await prisma.roundHistory.create({
-        data: {
+      await supabase
+        .from('RoundHistory')
+        .insert([{
           roundId: currentRoundId,
           seed: currentSeed,
           hash: currentHash,
           crashPoint: roundMultiplier
-        }
-      });
+        }]);
 
       // Settle all remaining active bets as LOST
       for (const [userId, slots] of activeBets.entries()) {
@@ -106,10 +106,10 @@ const tick = async () => {
         if (slots.bet2 && slots.bet2.status === 'ACTIVE') slotsToUpdate.push(slots.bet2.id);
         
         if (slotsToUpdate.length > 0) {
-          await prisma.bet.updateMany({
-            where: { id: { in: slotsToUpdate } },
-            data: { status: 'LOST', profit: 0 }
-          });
+          await supabase
+            .from('Bet')
+            .update({ status: 'LOST', profit: 0 })
+            .eq('id', { in: slotsToUpdate });
         }
       }
       activeBets.clear();
@@ -146,7 +146,11 @@ io.use(async (socket, next) => {
   
   try {
     const payload = verifyToken(token);
-    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+    const { data: user } = await supabase
+      .from('User')
+      .select('*')
+      .eq('id', payload.userId)
+      .single();
     if (user) {
       socket.data.user = user;
     }
@@ -174,7 +178,11 @@ io.on('connection', (socket) => {
     
     socket.on('request-balance', async () => {
       if (user) {
-        const u = await prisma.user.findUnique({ where: { id: user.id } });
+        const { data: u } = await supabase
+          .from('User')
+          .select('*')
+          .eq('id', user.id)
+          .single();
         if (u) {
           socket.emit('balance-update', u.balance);
         }
@@ -197,39 +205,57 @@ io.on('connection', (socket) => {
       }
 
       try {
-        let bet: any;
         // Atomic balance check and update
-        const updatedUser = await (prisma as any).$transaction(async (tx: any) => {
-          const u = await tx.user.findUnique({ where: { id: user.id } });
-          if (!u || u.balance < amount) throw new Error('Insufficient balance');
-          
-          bet = await tx.bet.create({
-            data: {
-              userId: user.id,
-              roundId: currentRoundId,
-              amount: amount,
-              autoCashout: data.autoCashout ? parseFloat(data.autoCashout.toString()) : null,
-              status: 'ACTIVE'
-            }
-          });
+        const { data: u, error: e } = await supabase
+          .from('User')
+          .select('*')
+          .eq('id', user.id)
+          .single();
+        if (!u || u.balance < amount) throw new Error('Insufficient balance');
 
-          return tx.user.update({
-            where: { id: user.id },
-            data: { balance: { decrement: amount } }
-          });
-        });
+        // Create bet record
+        const betData = {
+          userId: user.id,
+          roundId: currentRoundId,
+          betNumber: data.betNumber,
+          amount,
+          autoCashout: data.autoCashout,
+          status: 'ACTIVE'
+        };
 
-        console.log(`✅ [BET SUCCESS] Created Bet ID: ${bet.id} | New Balance: ${updatedUser.balance}`);
+        const { data: bet, error: betError } = await supabase
+          .from('Bet')
+          .insert([betData])
+          .select();
+
+        if (betError || !bet || bet.length === 0) {
+          throw new Error('Failed to create bet');
+        }
+
+        const createdBet = Array.isArray(bet) ? bet[0] : bet;
+
+        // Update user balance
+        const { data: updatedUser, error: updateError } = await supabase
+          .from('User')
+          .update({ balance: u.balance - amount })
+          .eq('id', user.id)
+          .select();
+
+        if (updateError) {
+          throw new Error('Failed to update balance');
+        }
+
+        console.log(`✅ [BET SUCCESS] Created Bet ID: ${createdBet.id} | New Balance: ${updatedUser?.[0]?.balance || u.balance - amount}`);
 
         // Track in memory
         const current = activeBets.get(user.id) || {};
         current[`bet${data.betNumber}`] = {
-           ...bet,
+           ...createdBet,
            username: user.name
         };
         activeBets.set(user.id, current);
 
-        socket.emit('balance-update', updatedUser.balance);
+        socket.emit('balance-update', updatedUser?.[0]?.balance || u.balance - amount);
         
         // Broadcast to EVERYONE
         const flatBets: any[] = [];
@@ -259,30 +285,41 @@ io.on('connection', (socket) => {
       const profit = currentBet.amount * cashoutMultiplier;
 
       try {
-        const updatedUser = await (prisma as any).$transaction(async (tx: any) => {
-          // Double check status in DB to prevent race conditions
-          const dbBet = await tx.bet.findUnique({ where: { id: currentBet.id } });
-          if (!dbBet || dbBet.status !== 'ACTIVE') throw new Error('Already cashed out');
+        // Double check status in DB to prevent race conditions
+        const { data: dbBet } = await supabase
+          .from('Bet')
+          .select('*')
+          .eq('id', currentBet.id)
+          .single();
+        if (!dbBet || dbBet.status !== 'ACTIVE') throw new Error('Already cashed out');
 
-          await tx.bet.update({
-            where: { id: currentBet.id },
-            data: { 
-              status: 'CASHEDOUT', 
-              cashoutMultiplier, 
-              profit 
-            }
-          });
+        // Update bet
+        await supabase
+          .from('Bet')
+          .update({ 
+            status: 'CASHEDOUT', 
+            cashoutMultiplier, 
+            profit 
+          })
+          .eq('id', currentBet.id);
 
-          return tx.user.update({
-            where: { id: user.id },
-            data: { balance: { increment: profit } }
-          });
-        });
+        // Update user balance
+        await supabase
+          .from('User')
+          .update({ balance: (user?.balance || 0) + profit })
+          .eq('id', user.id);
 
         // Remove from memory
         userBets[`bet${data.betNumber}`].status = 'CASHEDOUT';
         
-        socket.emit('balance-update', updatedUser.balance);
+        // Get updated user balance
+        const { data: updatedUser } = await supabase
+          .from('User')
+          .select('balance')
+          .eq('id', user.id)
+          .single();
+        
+        socket.emit('balance-update', updatedUser?.balance || (user?.balance || 0) + profit);
         socket.emit('cashout-success', { 
           betNumber: data.betNumber, 
           multiplier: cashoutMultiplier, 
@@ -302,8 +339,7 @@ httpServer.listen(PORT, async () => {
   console.log(`Premium Crash Server (Provably Fair) running on port ${PORT}`);
   
   try {
-    await prisma.$connect();
-    console.log('✅ [DB] Connected to dev.db via LibSql Adapter');
+    console.log('✅ [DB] Connected to Supabase');
   } catch (err) {
     console.error('❌ [DB] Connection Failed at startup:', err);
   }

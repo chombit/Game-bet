@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { prisma } from '../db';
+import { supabase } from '../db';
 import { signToken } from '../auth';
 
 const router = Router();
@@ -21,24 +21,35 @@ router.post('/register', async (req: Request, res: Response) => {
   try {
     const { phone, name, password } = RegisterSchema.parse(req.body);
 
-    const existing = await prisma.user.findUnique({ where: { phone } });
+    const { data: existing } = await supabase
+      .from('User')
+      .select('*')
+      .eq('phone', phone)
+      .single();
     if (existing) {
       return res.status(400).json({ error: 'Phone number already registered. Please login.' });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const user = await prisma.user.create({
-      data: { phone, name, passwordHash, balance: 1000 },
-    });
+    const { data: user, error } = await supabase
+      .from('User')
+      .insert([{ phone, name, passwordHash, balance: 1000 }])
+      .select();
+    
+    if (error) {
+      return res.status(500).json({ error: 'Registration failed.' });
+    }
+    
+    const insertedUser = Array.isArray(user) ? user[0] : user;
 
-    const token = signToken(user.id, user.phone);
+    const token = signToken(insertedUser.id, insertedUser.phone);
 
     console.log(`✅ New user registered: ${name} (+251${phone})`);
 
     return res.json({
       token,
-      user: { id: user.id, phone: user.phone, name: user.name, balance: user.balance },
+      user: { id: insertedUser.id, phone: insertedUser.phone, name: insertedUser.name, balance: insertedUser.balance },
     });
   } catch (err: any) {
     if (err.name === 'ZodError') {
@@ -53,7 +64,11 @@ router.post('/login', async (req: Request, res: Response) => {
   try {
     const { phone, password } = LoginSchema.parse(req.body);
 
-    const user = await prisma.user.findUnique({ where: { phone } });
+    const { data: user } = await supabase
+      .from('User')
+      .select('*')
+      .eq('phone', phone)
+      .single();
     if (!user) {
       return res.status(401).json({ error: 'Account not found. Please register first.' });
     }
@@ -89,10 +104,11 @@ router.get('/me', async (req: Request, res: Response) => {
   try {
     const { verifyToken } = await import('../auth');
     const payload = verifyToken(authHeader.slice(7));
-    const user = await prisma.user.findUnique({
-      where: { id: payload.userId },
-      select: { id: true, phone: true, name: true, balance: true, createdAt: true },
-    });
+    const { data: user } = await supabase
+      .from('User')
+      .select('*')
+      .eq('id', payload.userId)
+      .single();
     if (!user) return res.status(404).json({ error: 'User not found' });
     return res.json({ user });
   } catch {
