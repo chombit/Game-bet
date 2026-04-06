@@ -13,19 +13,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health check endpoint for Vercel
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // API Routes
 app.use('/api/auth', authRouter);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
-    origin: 'http://localhost:5173',
+    origin: process.env.NODE_ENV === 'production' ? 'https://your-game-domain.vercel.app' : 'http://localhost:5173',
     methods: ['GET', 'POST'],
     credentials: true
   }
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const SERVER_SALT = 'ENAT_BET_PREMIUM_SALT_2026';
 
 type GameState = 'WAITING' | 'COUNTDOWN' | 'FLYING' | 'CRASHED';
